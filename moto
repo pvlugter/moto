@@ -1,0 +1,486 @@
+#!/usr/bin/env bash
+#
+# moto - install all the things
+
+# script details
+
+function _script_path {
+  local source="${BASH_SOURCE[0]}"
+  while [ -h "$source" ] ; do
+    local linked="$(readlink "$source")"
+    local dir="$(cd -P $(dirname "$source") && cd -P $(dirname "$linked") && pwd)"
+    source="$dir/$(basename "$linked")"
+  done
+  echo ${source}
+}
+
+declare -r script_path=$(_script_path)
+declare -r script_name=$(basename "$script_path")
+declare -r script_dir="$(cd -P "$(dirname "$script_path")" && pwd)"
+declare -r moto_dir="$(cd "$script_dir/.." && pwd)"
+
+# locations
+
+declare -r MOTO_HOME="$HOME"
+
+declare -r MOTO_CONFIG="$HOME/.config/moto"
+declare -r MOTO_DATA="$HOME/.local/share/moto"
+
+declare -r MOTO_MIRROR="$MOTO_DATA/mirror.git"
+declare -r MOTO_DOT="$MOTO_DATA/dot"
+
+# echo logs
+
+function red {
+  echo -en "\033[0;31m$@\033[0m"
+}
+
+function green {
+  echo -en "\033[0;32m$@\033[0m"
+}
+
+function yellow {
+  echo -en "\033[0;33m$@\033[0m"
+}
+
+function blue {
+  echo -en "\033[0;34m$@\033[0m"
+}
+
+function info {
+  echo "$@"
+}
+
+function error {
+  echo -n $(red "!  ") 1>&2
+  echo "$@" 1>&2
+}
+
+function fail {
+  error "$@"
+  exit 1
+}
+
+# application / command / function checks
+
+function application_exists {
+  test -e "/Applications/$1.app/"
+}
+
+function command_exists {
+  type -P "$1" > /dev/null 2>&1
+}
+
+function function_exists {
+  declare -f "$1" > /dev/null
+}
+
+# moto subcommands
+
+function moto__help {
+  cat <<EOM
+Commands:
+  moto backup
+  moto check
+  moto connect
+  moto dot
+  moto help
+  moto init
+  moto install
+  moto list
+  moto status
+  moto update
+EOM
+}
+
+function moto__help__backup {
+  cat <<EOM
+moto backup [options] [packages]
+
+Options:
+  --auto  Create automatic commit messages
+EOM
+}
+
+function moto__backup {
+  local auto=false
+  local -a packages
+  while [[ $# -gt 0 ]] ; do
+    case "$1" in
+      --auto ) auto=true ; shift ;;
+      * ) packages+=("$1") ; shift ;;
+    esac
+  done
+  if [ ${#packages[@]} -eq 0 ]; then
+    packages=($(moto__list))
+  fi
+  local package
+  for package in "${packages[@]}" ; do
+    local package_dir="$MOTO_CONFIG/$package"
+    local dot_repo="$MOTO_DOT/$package.git"
+    [ ! -e "$dot_repo" ] && moto__init "$package"
+    if [ -e "$dot_repo" ] ; then
+      moto__dot "$package" add "$package_dir"
+      if [ -f "$package_dir/dotfiles" ] ; then
+        while read -r dotfile ; do
+          if [[ ! $dotfile == "#"* ]] ; then
+            moto__dot "$package" add "$HOME/$dotfile"
+          fi
+        done < "$package_dir/dotfiles"
+      fi
+      if ! moto__dot "$package" diff --staged --quiet ; then
+        if $auto ; then
+          info "Auto committing changes for $(blue "dot $package")"
+          moto__dot "$package" -c user.name="auto moto" -c user.email="auto@moto" commit -am "Save changes for $package"
+        else
+          info "Committing changes for $(blue "dot $package")"
+          moto__status --verbose "$package"
+          local message
+          read -p "Commit message (enter nothing to open editor): " message
+          if [ -z "$message" ] ; then
+            moto__dot "$package" commit
+          else
+            moto__dot "$package" commit -am "$message"
+          fi
+        fi
+      else
+        info "No changes for $(blue "dot $package")"
+      fi
+      if moto__dot "$package" rev-parse HEAD &> /dev/null ; then
+        local commits_ahead=$(moto__dot "$package" rev-list --count --right-only "@{upstream}...HEAD" 2> /dev/null || echo 1)
+        if [ $commits_ahead -ne 0 ] ; then
+          info "Pushing local-only changes for $(blue "dot $package")"
+          moto__dot "$package" push
+        fi
+      fi
+    else
+      error "No repository for $(red "dot $package"), use $(blue "moto init $package")"
+    fi
+    echo ""
+  done
+  git --git-dir="$MOTO_MIRROR" push
+}
+
+function moto__help__check {
+  cat <<EOM
+moto check [options] [packages]
+
+Options:
+  -q | --quiet  Don't print results from checks
+EOM
+}
+
+function moto__check {
+  local quiet=false
+  local -a packages
+  while [[ $# -gt 0 ]] ; do
+    case "$1" in
+      -q | --quiet ) quiet=true ; shift ;;
+      * ) packages+=("$1") ; shift ;;
+    esac
+  done
+  if [ ${#packages[@]} -eq 0 ]; then
+    packages=($(moto__list))
+  fi
+  local failed=0
+  local package
+  for package in "${packages[@]}" ; do
+    local package_dir="$MOTO_CONFIG/$package"
+    if [ -f "$package_dir/check.bash" ] ; then
+      export MOTO_PACKAGE="$package_dir"
+      export -f application_exists
+      export -f command_exists
+      if bash "$package_dir/check.bash" ; then
+        $quiet || info "$(green "+  $package")"
+      else
+        $quiet || info "$(red "!  $package")"
+        failed=$((failed + 1))
+      fi
+    else
+      $quiet || info "$(yellow "?  $package")"
+      failed=$((failed + 1))
+    fi
+  done
+  return $failed
+}
+
+function moto__help__connect {
+  cat <<EOM
+moto connect <repository>
+EOM
+}
+
+function moto__connect {
+  local remote="$1"
+  [ -e "$MOTO_MIRROR" ] && fail "moto already connected to a remote repository"
+  [ -z "$remote" ] && fail "moto connect requires a remote repository"
+  mkdir -p "$MOTO_DATA"
+  git clone --mirror "$remote" "$MOTO_MIRROR"
+  echo "ref: refs/heads/master" > "$MOTO_MIRROR/HEAD"
+}
+
+function moto__help__dot {
+  cat <<EOM
+moto dot <package> <git command>
+EOM
+}
+
+function moto__dot {
+  local package="$1"
+  shift
+  [ -z "$package" ] && fail "moto dot requires a package name"
+  local dot_repo="$MOTO_DOT/$package.git"
+  if [ -e "$dot_repo" ] ; then
+    git --git-dir="$dot_repo" "$@"
+  else
+    error "moto $(red "dot $package") doesn't exist"
+  fi
+}
+
+function moto__help__init {
+  cat <<EOM
+moto init <package>
+EOM
+}
+
+function moto__init {
+  local package="$1"
+  [ -z "$package" ] && fail "moto init requires a package name"
+  local dot_repo="$MOTO_DOT/$package.git"
+  if [ ! -e "$dot_repo" ] ; then
+    mkdir -p "$MOTO_DOT"
+    info "Initialising moto package $(blue "$package")"
+    git --git-dir="$dot_repo" init --shared=false
+    git --git-dir="$dot_repo" config moto.dot 'true'
+    git --git-dir="$dot_repo" config core.bare false
+    git --git-dir="$dot_repo" config core.worktree "$MOTO_HOME"
+    git --git-dir="$dot_repo" config core.excludesfile "$MOTO_CONFIG/$package/dotignore"
+    git --git-dir="$dot_repo" remote add origin "$MOTO_MIRROR"
+    git --git-dir="$dot_repo" checkout -b "$package" || return $?
+    git --git-dir="$dot_repo" config branch."$package".remote origin
+    git --git-dir="$dot_repo" config branch."$package".merge  refs/heads/"$package"
+    if [ $(git --git-dir="$dot_repo" ls-remote origin "$package" 2> /dev/null | wc -l ) -lt 1 ] ; then
+      info "Initialised empty $(blue "dot $package")"
+    else
+      git --git-dir="$dot_repo" fetch origin "$package"
+      local path
+      local exists=false
+      while read path ; do
+        [ -e "$path" ] && error "Already exists: $path" && exists=true
+      done < <(git --git-dir="$dot_repo" ls-tree -r --name-only "origin/$package")
+      if $exists ; then
+        info "Stashing existing files for dot $(blue "$package")"
+        git --git-dir="$dot_repo" reset --mixed "origin/$package"
+        git --git-dir="$dot_repo" stash || true
+      else
+        git --git-dir="$dot_repo" -c merge.ff=true merge "origin/$package"
+      fi
+      info "Initialised $(blue "dot $package")"
+    fi
+    if [ ! -e "$MOTO_CONFIG/$package" ] ; then
+      mkdir -p $MOTO_CONFIG/$package
+      info "Created config directory for $(blue "$package") at $MOTO_CONFIG/$package"
+    fi
+  fi
+}
+
+function moto__help__install {
+  cat <<EOM
+moto install [options] [packages]
+
+Options:
+  --all    Install all possible packages
+  --force  Ignore checks and always run install for packages
+  --only   Only install these packages, don't follow dependencies
+EOM
+}
+
+function moto__install {
+  local all=false
+  local force=false
+  local only=false
+  local -a packages
+  while [[ $# -gt 0 ]] ; do
+    case "$1" in
+      --all ) all=true ; shift ;;
+      --force ) force=true ; shift ;;
+      --only ) only=true ; shift ;;
+      * ) packages+=("$1") ; shift ;;
+    esac
+  done
+  local -a dependency_options
+  $force && dependency_options+=("--force")
+  if [ ${#packages[@]} -eq 0 ] && $all ; then
+    packages=($(moto__list --all))
+  fi
+  local package
+  for package in "${packages[@]}" ; do
+    moto__init "$package"
+    if ! $only && [ -f "$MOTO_CONFIG/$package/motofile" ] ; then
+      while read -r dependency ; do
+        if [[ ! $dependency == "#"* ]] ; then
+          moto__install "${dependency_options[@]}" "$dependency"
+        fi
+      done < "$MOTO_CONFIG/$package/motofile"
+    fi
+    if [ -f "$MOTO_CONFIG/$package/install.bash" ] ; then
+      if $force || ! moto__check --quiet "$package" ; then
+        info "=> Installing $(blue "$package")"
+        export MOTO_PACKAGE="$MOTO_CONFIG/$package"
+        export -f application_exists
+        export -f command_exists
+        bash "$MOTO_CONFIG/$package/install.bash"
+      fi
+    fi
+  done
+}
+
+function moto__help__list {
+  cat <<EOM
+moto list [options]
+
+Options:
+  -a | --all      List all packages from the connected repository
+  -d | --dot      List all packages with dot repositories
+  -m | --missing  List all packages which are not installed
+EOM
+}
+
+function moto__list {
+  local all=false
+  local dot=false
+  local missing=false
+  while [[ $# -gt 0 ]] ; do
+    case "$1" in
+      -a | --all ) all=true ; shift ;;
+      -d | --dot ) dot=true ; shift ;;
+      -m | --missing ) missing=true ; shift ;;
+      * ) error "$(red "unknown option: $1")" ; shift ;;
+    esac
+  done
+  if $missing ; then
+    local packages=($(moto__list --all))
+    local package
+    for package in "${packages[@]}" ; do
+      [ ! -e "$MOTO_CONFIG/$package" ] && echo "$package"
+    done
+  elif $all ; then
+    if [ -e "$MOTO_MIRROR" ] ; then
+      git --git-dir="$MOTO_MIRROR" for-each-ref --format="%(refname:short)" "refs/heads/"
+    else
+      error "Not connected to a remote repository"
+    fi
+  elif $dot ; then
+    if [ -e "$MOTO_DOT" ] ; then
+      local dot
+      for dot in "$MOTO_DOT"/* ; do
+        echo $(basename "$dot" .git)
+      done
+    fi
+  else
+    if [ -e "$MOTO_CONFIG" ] ; then
+      local package
+      for package in "$MOTO_CONFIG"/* ; do
+        echo $(basename "$package")
+      done
+    fi
+  fi
+}
+
+function moto__help__status {
+  cat <<EOM
+moto status [options] [packages]
+
+Options:
+  -v | --verbose  Print all details for status
+EOM
+}
+
+function moto__status {
+  local verbose=false
+  local -a packages
+  while [[ $# -gt 0 ]] ; do
+    case "$1" in
+      -v | --verbose ) verbose=true ; shift ;;
+      * ) packages+=("$1") ; shift ;;
+    esac
+  done
+  if [ ${#packages[@]} -eq 0 ]; then
+    packages=($(moto__list))
+  fi
+  local package
+  for package in "${packages[@]}" ; do
+    $verbose && echo "$(blue "$package"):"
+    moto__check $($verbose && echo "" || echo "--quiet") "$package" || (! $verbose && echo "$(red "!  $package")")
+    local package_dir="$MOTO_CONFIG/$package"
+    local dot_repo="$MOTO_DOT/$package.git"
+    if [ -e "$dot_repo" ] ; then
+      if $verbose ; then
+        info "$(green "@  dot $package")"
+        moto__dot "$package" -c color.status=always status --branch --short "$package_dir"
+        if [ -f "$package_dir/dotfiles" ] ; then
+          while read -r dotfile ; do
+            if [[ ! $dotfile == "#"* ]] ; then
+              moto__dot "$package" -c color.status=always status --short "$HOME/$dotfile"
+            fi
+          done < "$package_dir/dotfiles"
+        fi
+      else
+        local changes=$(($(moto__dot "$package" status --porcelain "$package_dir" | wc -l)))
+        if [ -f "$package_dir/dotfiles" ] ; then
+          while read -r dotfile ; do
+            if [[ ! $dotfile == "#"* ]] ; then
+              changes=$(($changes + $(moto__dot "$package" status --porcelain "$HOME/$dotfile" | wc -l)))
+            fi
+          done < "$package_dir/dotfiles"
+        fi
+        [ $changes -ne 0 ] && echo "$(yellow "*  dot $package")"
+      fi
+    else
+      echo "$(red "!  dot $package")"
+    fi
+    $verbose && echo ""
+  done
+}
+
+function moto__help__update {
+  cat <<EOM
+moto update [packages]
+EOM
+}
+
+function moto__update {
+  git --git-dir="$MOTO_MIRROR" --bare fetch
+  local packages=("$@")
+  if [ ${#packages[@]} -eq 0 ]; then
+    packages=($(moto__list))
+  fi
+  local package
+  for package in "${packages[@]}" ; do
+    if moto__dot "$package" fetch --quiet origin "$package" 2> /dev/null ; then
+      local commits_behind=$(moto__dot "$package" rev-list --count --left-only "@{upstream}...HEAD" 2> /dev/null || echo 0)
+      if [ $commits_behind -ne 0 ] ; then
+        echo "Updating" $(blue "$package")
+        moto__dot "$package" pull origin "$package"
+      fi
+    fi
+  done
+}
+
+# run moto subcommand
+
+declare -r subcommand=$1
+case $subcommand in
+  "" )
+    moto__help
+    ;;
+  "help" )
+    shift
+    function_exists "moto__help__$1" && "moto__help__$1" || moto__help
+    ;;
+  * )
+    shift
+    function_exists "moto__${subcommand}" || fail "subcommand does not exist: ${subcommand}"
+    "moto__${subcommand}" "$@"
+    ;;
+esac
