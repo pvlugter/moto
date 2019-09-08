@@ -219,6 +219,34 @@ function moto__connect {
   echo "ref: refs/heads/master" > "$MOTO_MIRROR/HEAD"
 }
 
+function moto__help__delete {
+  cat <<EOM
+moto delete [options] [packages]
+
+Options:
+  --uninstall  Uninstall local packages before deleting package branches
+EOM
+}
+
+function moto__delete {
+  local uninstall=false
+  local -a packages
+  while [[ $# -gt 0 ]] ; do
+    case "$1" in
+      --uninstall ) uninstall=true ; shift ;;
+      * ) packages+=("$1") ; shift ;;
+    esac
+  done
+  local package
+  for package in "${packages[@]}" ; do
+    $uninstall && moto__uninstall "$package"
+    info "Deleting package $(yellow "$package")"
+    git --git-dir="$MOTO_MIRROR" branch -D "$package"
+    git --git-dir="$MOTO_MIRROR" push
+  done
+}
+
+
 function moto__help__dot {
   cat <<EOM
 moto dot <package> <git command>
@@ -440,6 +468,59 @@ function moto__status {
       echo "$(red "!  dot $package")"
     fi
     $verbose && echo ""
+  done
+}
+
+function moto__help__uninstall {
+  cat <<EOM
+moto uninstall [packages]
+EOM
+}
+
+function moto__uninstall {
+  local -a packages
+  while [[ $# -gt 0 ]] ; do
+    case "$1" in
+      * ) packages+=("$1") ; shift ;;
+    esac
+  done
+  local package
+  for package in "${packages[@]}" ; do
+    if [ -f "$MOTO_CONFIG/$package/uninstall.bash" ] ; then
+      info "=> Uninstalling $(yellow "$package")"
+      export MOTO_PACKAGE="$MOTO_CONFIG/$package"
+      export -f application_exists
+      export -f command_exists
+      bash "$MOTO_CONFIG/$package/uninstall.bash"
+    else
+      error "No uninstall script for $(red "$package")"
+    fi
+    local package_dir="$MOTO_CONFIG/$package"
+    local dot_repo="$MOTO_DOT/$package.git"
+    local files=($(moto__dot "$package" ls-files))
+    info "$(yellow The following files and directories will be removed):"
+    for file in "${files[@]}" ; do
+      info "$MOTO_HOME/$file"
+    done
+    info "$package_dir"
+    moto__dot "$package" -c color.status=always status --short "$package_dir"
+    info "$dot_repo"
+    local remove=false
+    read -p "$(yellow "Continue with removing files?") (type: 'Yes'): " response
+    case $response in
+      Yes ) remove=true ;;
+      * ) ;;
+    esac
+    if $remove ; then
+      for file in "${files[@]}" ; do
+        [ -f "$MOTO_HOME/$file" ] && info "$(yellow "Removing:") $MOTO_HOME/$file" && rm -f "$MOTO_HOME/$file"
+      done
+      [ -e "$package_dir" ] && info "$(yellow "Removing:") $package_dir" && rm -rf "$package_dir"
+      [ -e "$dot_repo" ] && info "$(yellow "Removing:") $dot_repo" && rm -rf "$dot_repo"
+      info "Uninstalled $(green "$package")"
+    else
+      error "Not removing files for $(red "$package")"
+    fi
   done
 }
 
